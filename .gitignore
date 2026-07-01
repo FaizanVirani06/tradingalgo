@@ -1,0 +1,26 @@
+# secrets -- never commit
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# generated at runtime
+cache/
+output/
+
+# raw market data dumps (large, regenerable, not source)
+*.dbn
+*.dbn.zst
+*.zip
+GLBX-*/
+
+# editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# local assistant tooling
+.claude/

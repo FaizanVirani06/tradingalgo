@@ -1,0 +1,17 @@
+# Core (required)
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.3
+scipy>=1.11
+matplotlib>=3.7
+requests>=2.31
+python-dotenv>=1.0
+
+# Optional: only needed for the Databento historical order-flow path
+# (data_clients.load_universe_databento). Not needed for live trading
+# (live_trader.py talks to TopstepX/ProjectX Gateway directly over requests).
+databento>=0.62
+
+# Notes:
+#  - No pyarrow needed: caches are pickle, not parquet.
+#  - Tested on Python 3.12 with pandas 3.0 / numpy 2.4 / scikit-learn 1.8.
