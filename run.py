@@ -2028,6 +2028,236 @@ def cmd_sizing(args):
 
 
 # ============================================================================
+# session-gap / orb-pullback / vwap-bands / news-fade -- EXPERIMENTAL GC ideas
+# ============================================================================
+#
+# All four fire far less often than the production structure strategy (once a
+# day at most, or only on days with a qualifying event), so the usual
+# min_trades_in_sample gate would reject almost every fold outright.
+# --min-trades on each subcommand exposes a deliberate bypass of that floor
+# so a couple of months of data is enough to get a first read on whether an
+# idea is worth pursuing further -- treat the results as a first look, not a
+# statistically reliable sample.
+
+def _load_universe_experimental(source: str, dbn_path: str | None,
+                                strategy_label: str) -> dict[str, pd.DataFrame]:
+    if source == "databento":
+        if not dbn_path:
+            print("  ERROR: --source databento requires --dbn-path.", file=sys.stderr)
+            sys.exit(1)
+        print(f"  loading Databento bars from: {dbn_path}")
+        return data_clients.load_universe_databento(dbn_path, interval=config.INTERVAL)
+    if source == "eodhd":
+        print(f"  WARNING: EODHD proxies (e.g. GLD.US) only trade RTH hours -- "
+              f"{strategy_label} needs real overnight/pre-market futures bars "
+              f"for a faithful test. Use --source databento.")
+        return data_clients.load_universe(interval=config.INTERVAL)
+    print(f"  ERROR: --source must be 'databento' or 'eodhd' (got '{source}').",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+def _report_experimental(result, target: str, strategy_label: str,
+                         slug: str, min_trades: int, sparsity_note: str) -> None:
+    m      = result.oos_metrics
+    ts_res = m.get("topstep")
+    d      = result.degradation
+
+    lines = []
+    P = lines.append
+    P("=" * 70)
+    P(f"  {strategy_label.upper()} RESULT FOR {target}  (OOS walk-forward, EXPERIMENTAL)")
+    P(f"  min_trades floor used: {min_trades}  (vs config default "
+      f"{config.WALKFORWARD.min_trades_in_sample}) -- read trade counts accordingly")
+    P("=" * 70)
+    P(f"    total PnL       : ${m['total_pnl_$']:,.0f}  ({m['return_pct']:+.1f}%)")
+    P(f"    Sharpe          : {m['sharpe']:.2f}")
+    P(f"    max drawdown    : ${m['max_drawdown_$']:,.0f}  ({m['max_drawdown_pct']:.1f}%)")
+    P(f"    profit factor   : {m['profit_factor']}")
+    P(f"    win rate        : {m['win_rate']:.1f}%")
+    P(f"    trades          : {m['n_trades']}")
+    P(f"    folds profitable: {m.get('pct_folds_profitable')}%")
+    P(f"    IS Sharpe mean  : {d.get('is_sharpe_mean')}")
+    P(f"    OOS Sharpe      : {d.get('oos_sharpe')}")
+    P("")
+    if ts_res is not None:
+        P(f"    Topstep passed  : {ts_res.passed}")
+        P(f"    max trail DD    : ${ts_res.max_trailing_drawdown:,.0f}")
+        P(f"    worst day       : ${ts_res.worst_day:,.0f}")
+        for fr in ts_res.failed_rules:
+            P(f"    !! {fr}")
+    P("=" * 70)
+    P(f"  NOTE: {sparsity_note} this is a FIRST LOOK, not a statistically")
+    P("  reliable sample. Treat any Sharpe/PF here as noisy until validated")
+    P("  over a much longer history.")
+
+    text = "\n".join(lines)
+    print("\n" + text)
+
+    out = config.OUTPUT_DIR
+    (out / f"report_{slug}_{target}.txt").write_text(text, encoding="utf-8")
+    result.fold_summaries.to_csv(out / f"folds_{slug}_{target}.csv", index=False)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    eq = result.oos_equity
+    ax.plot(eq.index, eq.values, lw=1.2)
+    peak = eq.cummax()
+    ax.fill_between(eq.index, eq.values, peak.values,
+                    where=(eq < peak), alpha=0.2, color="red")
+    ax.axhline(config.TOPSTEP.starting_balance, ls="--", c="grey", lw=0.8)
+    ax.set_title(f"{target} {strategy_label} (experimental) — OOS equity")
+    ax.set_ylabel("Account equity ($)")
+    fig.tight_layout()
+    fig.savefig(out / f"equity_{slug}_{target}.png", dpi=120)
+    plt.close(fig)
+    print(f"  Plot: {out / f'equity_{slug}_{target}.png'}")
+
+
+def _run_instrument_session_gap(universe: dict, target: str, min_trades: int) -> None:
+    print(f"\n{'#'*70}\n# {target} — SESSION-GAP REVERSAL (EXPERIMENTAL)\n{'#'*70}")
+    if target not in universe:
+        print(f"  skipping {target}: not in loaded universe")
+        return
+    tdf = universe[target]
+    print(f"  {len(tdf)} bars  {tdf.index.min().date()} -> {tdf.index.max().date()}")
+    result = wf.run_session_gap_walk_forward(
+        tdf, instrument_key=target, n_contracts=1, verbose=True, min_trades=min_trades)
+    _report_experimental(result, target, "SESSION-GAP", "session_gap", min_trades,
+                         "with a once-a-day signal,")
+
+
+def cmd_session_gap(args):
+    bpd = _bars_per_day()
+    if args.quick:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 20, bpd * 7
+        config.WALKFORWARD.step_bars, config.WALKFORWARD.n_param_samples = bpd * 7, 20
+    else:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 30, bpd * 10
+        config.WALKFORWARD.step_bars = bpd * 10
+        config.WALKFORWARD.n_param_samples = args.n_samples or 60
+    print(f"  [{'quick' if args.quick else 'default'}] "
+          f"train={config.WALKFORWARD.train_bars} test={config.WALKFORWARD.test_bars} "
+          f"n_samples={config.WALKFORWARD.n_param_samples} min_trades={args.min_trades} "
+          f"(bypassing the usual {config.WALKFORWARD.min_trades_in_sample})")
+    universe = _load_universe_experimental(args.source, args.dbn_path, "session-gap")
+    try:
+        _run_instrument_session_gap(universe, args.instrument, args.min_trades)
+    except Exception as e:
+        import traceback
+        print(f"  !! {args.instrument} failed: {e}")
+        traceback.print_exc()
+
+
+def _run_instrument_orb_pullback(universe: dict, target: str, min_trades: int) -> None:
+    print(f"\n{'#'*70}\n# {target} — ORB PULLBACK (EXPERIMENTAL)\n{'#'*70}")
+    if target not in universe:
+        print(f"  skipping {target}: not in loaded universe")
+        return
+    tdf = universe[target]
+    print(f"  {len(tdf)} bars  {tdf.index.min().date()} -> {tdf.index.max().date()}")
+    result = wf.run_orb_pullback_walk_forward(
+        tdf, instrument_key=target, n_contracts=1, verbose=True, min_trades=min_trades)
+    _report_experimental(result, target, "ORB PULLBACK", "orb_pullback", min_trades,
+                         "with a once-a-day signal,")
+
+
+def cmd_orb_pullback(args):
+    bpd = _bars_per_day()
+    if args.quick:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 20, bpd * 7
+        config.WALKFORWARD.step_bars, config.WALKFORWARD.n_param_samples = bpd * 7, 20
+    else:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 30, bpd * 10
+        config.WALKFORWARD.step_bars = bpd * 10
+        config.WALKFORWARD.n_param_samples = args.n_samples or 60
+    print(f"  [{'quick' if args.quick else 'default'}] "
+          f"train={config.WALKFORWARD.train_bars} test={config.WALKFORWARD.test_bars} "
+          f"n_samples={config.WALKFORWARD.n_param_samples} min_trades={args.min_trades} "
+          f"(bypassing the usual {config.WALKFORWARD.min_trades_in_sample})")
+    universe = _load_universe_experimental(args.source, args.dbn_path, "orb-pullback")
+    try:
+        _run_instrument_orb_pullback(universe, args.instrument, args.min_trades)
+    except Exception as e:
+        import traceback
+        print(f"  !! {args.instrument} failed: {e}")
+        traceback.print_exc()
+
+
+def _run_instrument_vwap_bands(universe: dict, target: str, min_trades: int) -> None:
+    print(f"\n{'#'*70}\n# {target} — VWAP BANDS (EXPERIMENTAL)\n{'#'*70}")
+    if target not in universe:
+        print(f"  skipping {target}: not in loaded universe")
+        return
+    tdf = universe[target]
+    print(f"  {len(tdf)} bars  {tdf.index.min().date()} -> {tdf.index.max().date()}")
+    result = wf.run_vwap_bands_walk_forward(
+        tdf, instrument_key=target, n_contracts=1, verbose=True, min_trades=min_trades)
+    _report_experimental(result, target, "VWAP BANDS", "vwap_bands", min_trades,
+                         "even at higher frequency than the other experimental strategies,")
+
+
+def cmd_vwap_bands(args):
+    bpd = _bars_per_day()
+    if args.quick:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 20, bpd * 7
+        config.WALKFORWARD.step_bars, config.WALKFORWARD.n_param_samples = bpd * 7, 20
+    else:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 30, bpd * 10
+        config.WALKFORWARD.step_bars = bpd * 10
+        config.WALKFORWARD.n_param_samples = args.n_samples or 60
+    print(f"  [{'quick' if args.quick else 'default'}] "
+          f"train={config.WALKFORWARD.train_bars} test={config.WALKFORWARD.test_bars} "
+          f"n_samples={config.WALKFORWARD.n_param_samples} min_trades={args.min_trades} "
+          f"(vs config default {config.WALKFORWARD.min_trades_in_sample})")
+    universe = _load_universe_experimental(args.source, args.dbn_path, "vwap-bands")
+    try:
+        _run_instrument_vwap_bands(universe, args.instrument, args.min_trades)
+    except Exception as e:
+        import traceback
+        print(f"  !! {args.instrument} failed: {e}")
+        traceback.print_exc()
+
+
+def _run_instrument_news_fade(universe: dict, target: str, min_trades: int) -> None:
+    print(f"\n{'#'*70}\n# {target} — NEWS FADE (EXPERIMENTAL)\n{'#'*70}")
+    if target not in universe:
+        print(f"  skipping {target}: not in loaded universe")
+        return
+    tdf = universe[target]
+    print(f"  {len(tdf)} bars  {tdf.index.min().date()} -> {tdf.index.max().date()}")
+    result = wf.run_news_fade_walk_forward(
+        tdf, instrument_key=target, n_contracts=1, verbose=True, min_trades=min_trades)
+    _report_experimental(result, target, "NEWS FADE", "news_fade", min_trades,
+                         "with a signal that only fires on abnormal-candle days,")
+
+
+def cmd_news_fade(args):
+    bpd = _bars_per_day()
+    # Needs a longer window than the other experimental strategies: it only
+    # fires on days with an outsized 08:30 candle, plus daily ATR needs ~3
+    # trading weeks of history to warm up before the spike threshold is
+    # meaningful, so a 1-month train window is too thin.
+    if args.quick:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 40, bpd * 15
+        config.WALKFORWARD.step_bars, config.WALKFORWARD.n_param_samples = bpd * 15, 20
+    else:
+        config.WALKFORWARD.train_bars, config.WALKFORWARD.test_bars = bpd * 60, bpd * 20
+        config.WALKFORWARD.step_bars = bpd * 20
+        config.WALKFORWARD.n_param_samples = args.n_samples or 60
+    print(f"  [{'quick' if args.quick else 'default'}] "
+          f"train={config.WALKFORWARD.train_bars} test={config.WALKFORWARD.test_bars} "
+          f"n_samples={config.WALKFORWARD.n_param_samples} min_trades={args.min_trades} "
+          f"(bypassing the usual {config.WALKFORWARD.min_trades_in_sample})")
+    universe = _load_universe_experimental(args.source, args.dbn_path, "news-fade")
+    try:
+        _run_instrument_news_fade(universe, args.instrument, args.min_trades)
+    except Exception as e:
+        import traceback
+        print(f"  !! {args.instrument} failed: {e}")
+        traceback.print_exc()
+
+
+# ============================================================================
 # smoketest -- Databento DBN smoke test
 # ============================================================================
 
@@ -2183,6 +2413,63 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchor", default="profit", choices=["profit", "floor"])
     p.add_argument("--safety", type=float, default=0.5)
     p.set_defaults(func=cmd_sizing)
+
+    # session-gap
+    p = sub.add_parser("session-gap", help="EXPERIMENTAL: London/NY session-gap "
+                                           "reversal (GC-motivated, fires ~once/day)")
+    p.add_argument("--source", default="databento", choices=["databento", "eodhd"],
+                   help="databento is effectively required -- EODHD proxies have "
+                        "no pre-market/London-session data")
+    p.add_argument("--dbn-path", default=None)
+    p.add_argument("--instrument", default="GC")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--n-samples", type=int, default=None)
+    p.add_argument("--min-trades", type=int, default=3,
+                   help="bypasses config.WALKFORWARD.min_trades_in_sample (default "
+                        "10) for this strategy only -- it fires ~once/day so the "
+                        "usual floor rejects almost every fold (default: 3)")
+    p.set_defaults(func=cmd_session_gap)
+
+    # orb-pullback
+    p = sub.add_parser("orb-pullback", help="EXPERIMENTAL: 15m opening-range "
+                                            "breakout, entered on pullback (fires ~once/day)")
+    p.add_argument("--source", default="databento", choices=["databento", "eodhd"])
+    p.add_argument("--dbn-path", default=None)
+    p.add_argument("--instrument", default="GC")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--n-samples", type=int, default=None)
+    p.add_argument("--min-trades", type=int, default=5,
+                   help="bypasses config.WALKFORWARD.min_trades_in_sample (default "
+                        "10) -- fires ~once/day (default: 5)")
+    p.set_defaults(func=cmd_orb_pullback)
+
+    # vwap-bands
+    p = sub.add_parser("vwap-bands", help="EXPERIMENTAL: anchored VWAP "
+                                          "standard-deviation band mean-reversion")
+    p.add_argument("--source", default="databento", choices=["databento", "eodhd"])
+    p.add_argument("--dbn-path", default=None)
+    p.add_argument("--instrument", default="GC")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--n-samples", type=int, default=None)
+    p.add_argument("--min-trades", type=int, default=10,
+                   help="fires more often than the other experimental strategies, "
+                        "so this defaults to the same floor as the standard gate "
+                        "(default: 10) -- lower it if a shorter window is too thin")
+    p.set_defaults(func=cmd_vwap_bands)
+
+    # news-fade
+    p = sub.add_parser("news-fade", help="EXPERIMENTAL: fade an abnormal 08:30 ET "
+                                         "candle (NFP/CPI proxy) toward its 61.8% retrace")
+    p.add_argument("--source", default="databento", choices=["databento", "eodhd"])
+    p.add_argument("--dbn-path", default=None)
+    p.add_argument("--instrument", default="GC")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--n-samples", type=int, default=None)
+    p.add_argument("--min-trades", type=int, default=2,
+                   help="bypasses config.WALKFORWARD.min_trades_in_sample (default "
+                        "10) -- only fires on days with an outsized 08:30 candle, "
+                        "the sparsest of the four experimental strategies (default: 2)")
+    p.set_defaults(func=cmd_news_fade)
 
     # live
     p = sub.add_parser("live", help="Live trading via TopstepX / ProjectX Gateway "

@@ -25,8 +25,37 @@ section:
     real NQ futures bars (Databento) where the detected zones sit at the
     prices real participants react to.
 
-All four are causal (zero look-ahead): every indicator only uses past/current
-bar information.
+  * SESSION GAP (generate_session_gap_signal) -- EXPERIMENTAL. London-range
+    sweep-and-fail reversal, entered only in a narrow NY-open window (default
+    08:30-09:00 ET). Fires at most once per calendar day, so a normal
+    walk-forward fold will rarely clear the usual min_trades_in_sample floor
+    -- see walkforward.run_session_gap_walk_forward and `python run.py
+    session-gap --min-trades`.
+
+  * ORB PULLBACK (generate_orb_pullback_signal) -- EXPERIMENTAL. 15-minute
+    opening-range breakout (08:30-08:45 ET), confirmed by a 5-minute close
+    beyond the range with an aligned 20-period SMA slope, entered on a
+    pullback BACK to the broken edge (not the initial break). Fires at most
+    once per calendar day.
+
+  * VWAP BANDS (generate_vwap_bands_signal) -- EXPERIMENTAL. Mean-reversion
+    off an anchored intraday VWAP (session anchor 18:00 ET) and its
+    volume-weighted standard-deviation bands: fade a 2.5-sigma touch back
+    toward 1-sigma, gated by an RSI extreme, hard-stopped past 3-sigma. Fires
+    whenever price reaches the outer band, so trades far more often than the
+    other experimental strategies.
+
+  * NEWS FADE (generate_news_fade_signal) -- EXPERIMENTAL. Fades an abnormally
+    large 08:30 ET candle (the NFP/CPI release time) back toward its 61.8%
+    Fibonacci retracement. Uses candle-size-vs-daily-ATR as a proxy for "a
+    market-moving release happened" rather than an economic calendar (this
+    repo has no calendar data source) -- see the docstring above the function
+    for how that adapts the original 1-minute/3x-ATR spec to 5-minute bars.
+    Fires only on days with an outsized 08:30 candle, so it is the sparsest
+    of the four.
+
+All are causal (zero look-ahead): every indicator only uses past/current bar
+information.
 """
 from __future__ import annotations
 from collections import defaultdict
@@ -1708,4 +1737,549 @@ def diagnose_structure(
         "bull_grab":   pd.Series(bull_grab,   index=df_5m.index),
         "bear_grab":   pd.Series(bear_grab,   index=df_5m.index),
         "signal":      signal,
+    }
+
+
+# ============================================================================
+# EXPERIMENTAL: London/NY session-gap reversal
+# ============================================================================
+#
+# Gold-motivated idea: London often drives a directional move between 03:00
+# and 08:00 ET that gets faded once NY liquidity arrives. Rules:
+#
+#   1. Track the London session's high/low/VWAP as it forms (03:00-08:00 ET).
+#   2. In the NY-open window (08:30-09:00 ET), watch each completed 15-minute
+#      candle. If price sweeps outside the London range by more than
+#      sweep_atr_mult * ATR intrabar, but that 15m candle's own CLOSE ends up
+#      back inside the range (wick swept out, close failed to hold outside),
+#      fade the sweep back toward the London session's VWAP.
+#   3. Stop = the sweep extreme +/- stop_atr_mult * ATR. Target = London VWAP.
+#   4. At most ONE trade per calendar day (ET) -- this fires roughly once a
+#      day, not once a bar, so expect thin per-fold trade counts.
+#
+# Causality note: "the 15-minute candle's close" is read directly off the
+# LAST 5-minute bar of that 15-minute block (its close IS the 15m candle's
+# close), so no resampling/look-ahead is needed -- the check only fires on
+# bars where (minute + 5) % 15 == 0.
+
+SESSION_GAP_DEFAULT_PARAMS: dict = {
+    "london_start_min":  3 * 60,        # 03:00 ET
+    "london_end_min":    8 * 60,        # 08:00 ET
+    "entry_start_min":   8 * 60 + 30,   # 08:30 ET
+    "entry_end_min":     9 * 60,        # 09:00 ET
+    "sweep_atr_mult":    1.0,   # sweep must clear the London range by this many ATR
+    "stop_atr_mult":     0.5,   # stop = sweep extreme +/- this many ATR
+    "atr_window":        14,
+    "max_hold_bars":     48,    # safety time stop (~4h of 5m bars) if neither hit
+}
+
+
+def _minutes_et(index: pd.DatetimeIndex) -> np.ndarray:
+    et = index.tz_convert(config.SESSION.timezone)
+    return np.asarray(et.hour) * 60 + np.asarray(et.minute)
+
+
+def generate_session_gap_signal(
+    df_5m: pd.DataFrame,
+    params: dict | None = None,
+    instrument_key: str = "",
+) -> tuple[pd.Series, pd.Series]:
+    """
+    London-range sweep-and-fail reversal, entered only in a narrow NY-open
+    window. At most one trade per calendar day (ET).
+
+    Returns (signal, size_scalar) like the other strategies -- size_scalar is
+    always 1.0 (no risk scaling implemented for this experimental strategy).
+    """
+    p = {**SESSION_GAP_DEFAULT_PARAMS, **(params or {})}
+    n = len(df_5m)
+    idx = df_5m.index
+    minutes = _minutes_et(idx)
+    day = np.asarray(idx.tz_convert(config.SESSION.timezone).date)
+
+    h = df_5m["high"].values
+    l = df_5m["low"].values
+    c = df_5m["close"].values
+    v = df_5m["volume"].values
+
+    atr = _structure_atr(df_5m, int(p["atr_window"])).values
+
+    lon_start, lon_end = int(p["london_start_min"]), int(p["london_end_min"])
+    ent_start, ent_end = int(p["entry_start_min"]), int(p["entry_end_min"])
+    sweep_mult, stop_mult = float(p["sweep_atr_mult"]), float(p["stop_atr_mult"])
+    max_hold = int(p["max_hold_bars"])
+
+    signal = np.zeros(n, dtype=float)
+    position, bars_held = 0, 0
+    stop_level = target_level = np.nan
+    traded_day = None
+
+    london_hi = london_lo = np.nan
+    lon_tp_vol_sum = lon_vol_sum = 0.0
+    block_hi = block_lo = np.nan
+    cur_day = day[0] if n else None
+
+    for i in range(n):
+        if day[i] != cur_day:
+            cur_day = day[i]
+            london_hi = london_lo = np.nan
+            lon_tp_vol_sum = lon_vol_sum = 0.0
+
+        m = minutes[i]
+
+        # accumulate the London session range + VWAP inputs, causally
+        if lon_start <= m < lon_end:
+            london_hi = h[i] if np.isnan(london_hi) else max(london_hi, h[i])
+            london_lo = l[i] if np.isnan(london_lo) else min(london_lo, l[i])
+            tp = (h[i] + l[i] + c[i]) / 3.0
+            lon_tp_vol_sum += tp * v[i]
+            lon_vol_sum    += v[i]
+
+        # track the CURRENT (still-forming) 15-minute block's range
+        if m % 15 == 0:
+            block_hi, block_lo = h[i], l[i]
+        else:
+            block_hi = h[i] if np.isnan(block_hi) else max(block_hi, h[i])
+            block_lo = l[i] if np.isnan(block_lo) else min(block_lo, l[i])
+
+        # ---- manage an existing position ----
+        if position != 0:
+            bars_held += 1
+            hit_stop = (position == 1 and l[i] <= stop_level) or \
+                       (position == -1 and h[i] >= stop_level)
+            hit_target = (position == 1 and h[i] >= target_level) or \
+                         (position == -1 and l[i] <= target_level)
+            if hit_stop or hit_target or bars_held >= max_hold:
+                position, bars_held = 0, 0
+                stop_level = target_level = np.nan
+
+        # ---- entry: only at the close of a completed 15m candle in-window ----
+        is_block_close = ((m + 5) % 15 == 0)
+        a = atr[i]
+        if (position == 0 and traded_day != cur_day and is_block_close
+                and ent_start <= m < ent_end and np.isfinite(a) and a > 0
+                and np.isfinite(london_hi) and np.isfinite(london_lo)):
+            vwap = (lon_tp_vol_sum / lon_vol_sum) if lon_vol_sum > 0 \
+                else (london_hi + london_lo) / 2.0
+
+            swept_up  = block_hi > london_hi + sweep_mult * a
+            swept_dn  = block_lo < london_lo - sweep_mult * a
+            failed_up = swept_up and c[i] <= london_hi   # wick out, 15m closed back in
+            failed_dn = swept_dn and c[i] >= london_lo
+
+            if failed_up and not failed_dn:
+                position = -1
+                stop_level, target_level = block_hi + stop_mult * a, vwap
+                bars_held, traded_day = 0, cur_day
+            elif failed_dn and not failed_up:
+                position = 1
+                stop_level, target_level = block_lo - stop_mult * a, vwap
+                bars_held, traded_day = 0, cur_day
+
+        signal[i] = position
+
+    return (pd.Series(signal, index=idx, name="signal"),
+            pd.Series(np.ones(n), index=idx, name="size_scalar"))
+
+
+def sample_session_gap_params(rng) -> dict:
+    """Random parameter set for walk-forward search."""
+    return {
+        "sweep_atr_mult": float(rng.choice([0.5, 0.75, 1.0, 1.25, 1.5])),
+        "stop_atr_mult":  float(rng.choice([0.25, 0.5, 0.75, 1.0])),
+        "atr_window":     int(rng.choice([10, 14, 20])),
+        "max_hold_bars":  int(rng.choice([24, 36, 48, 60])),
+    }
+
+
+# ============================================================================
+# EXPERIMENTAL: multi-timeframe ORB pullback
+# ============================================================================
+#
+#   1. Opening range = the 08:30-08:45 ET 15-minute block's high/low.
+#   2. Once formed, wait for a 5-minute bar to CLOSE completely beyond it --
+#      that's the breakout confirmation, not the entry.
+#   3. At confirmation, require the 20-period SMA's slope to agree with the
+#      breakout direction (a flat SMA kills the setup for the day).
+#   4. Arm a pending "limit order" back at the broken edge and wait for price
+#      to pull back to it (fill = the entry, not the breakout bar itself).
+#   5. Manage the fill with an ATR trailing stop + time stop (this is a trend
+#      -following exit, matching the strategy's own "Trend Following" label).
+#
+# At most one FILL per day; a breakout in the opposite direction before fill
+# re-arms the pending order to the new direction (the original call is
+# treated as a fakeout).
+
+ORB_PULLBACK_DEFAULT_PARAMS: dict = {
+    "or_start_min":       8 * 60 + 30,  # 08:30 ET
+    "or_end_min":         8 * 60 + 45,  # 08:45 ET
+    "sma_period":         20,
+    "slope_lookback":     3,      # bars back to measure the SMA slope over
+    "slope_min_atr_frac": 0.05,   # SMA must move >= this * ATR over slope_lookback bars
+    "max_wait_bars":      24,     # cancel the pending pullback order after this many bars
+    "stop_atr_mult":      1.5,    # trailing stop distance once filled, in ATR
+    "max_hold_bars":      36,
+    "atr_window":         14,
+}
+
+
+def generate_orb_pullback_signal(
+    df_5m: pd.DataFrame,
+    params: dict | None = None,
+    instrument_key: str = "",
+) -> tuple[pd.Series, pd.Series]:
+    p = {**ORB_PULLBACK_DEFAULT_PARAMS, **(params or {})}
+    n = len(df_5m)
+    idx = df_5m.index
+    minutes = _minutes_et(idx)
+    day = np.asarray(idx.tz_convert(config.SESSION.timezone).date)
+
+    h = df_5m["high"].values
+    l = df_5m["low"].values
+    c = df_5m["close"].values
+
+    atr = _structure_atr(df_5m, int(p["atr_window"])).values
+    sma = df_5m["close"].rolling(int(p["sma_period"])).mean().values
+
+    or_start, or_end = int(p["or_start_min"]), int(p["or_end_min"])
+    slope_lb   = int(p["slope_lookback"])
+    slope_frac = float(p["slope_min_atr_frac"])
+    max_wait   = int(p["max_wait_bars"])
+    stop_mult  = float(p["stop_atr_mult"])
+    max_hold   = int(p["max_hold_bars"])
+
+    signal = np.zeros(n, dtype=float)
+    position, bars_held = 0, 0
+    stop_level = np.nan
+    extreme = np.nan
+
+    or_hi = or_lo = np.nan
+    pending_dir = 0          # 0 = none armed, +1/-1 = waiting for a pullback fill
+    pending_level = np.nan
+    bars_since_confirm = 0
+    filled_today = False
+    cur_day = day[0] if n else None
+
+    for i in range(n):
+        if day[i] != cur_day:
+            cur_day = day[i]
+            or_hi = or_lo = np.nan
+            pending_dir = 0
+            filled_today = False
+
+        m = minutes[i]
+
+        if or_start <= m < or_end:
+            or_hi = h[i] if np.isnan(or_hi) else max(or_hi, h[i])
+            or_lo = l[i] if np.isnan(or_lo) else min(or_lo, l[i])
+
+        # ---- manage an existing position (ATR trailing stop + time stop) ----
+        if position != 0:
+            bars_held += 1
+            a = atr[i] + 1e-8
+            if position == 1:
+                extreme = max(extreme, c[i])
+                if c[i] < extreme - stop_mult * a or bars_held >= max_hold:
+                    position, bars_held = 0, 0
+                    stop_level = extreme = np.nan
+            else:
+                extreme = min(extreme, c[i])
+                if c[i] > extreme + stop_mult * a or bars_held >= max_hold:
+                    position, bars_held = 0, 0
+                    stop_level = extreme = np.nan
+
+        # ---- breakout confirmation (re)arms the pending pullback order ----
+        if (position == 0 and not filled_today and m >= or_end
+                and np.isfinite(or_hi) and np.isfinite(or_lo)
+                and i >= slope_lb and np.isfinite(sma[i]) and np.isfinite(sma[i - slope_lb])):
+            slope = sma[i] - sma[i - slope_lb]
+            a = atr[i]
+            slope_ok_long  = np.isfinite(a) and a > 0 and slope >  slope_frac * a
+            slope_ok_short = np.isfinite(a) and a > 0 and slope < -slope_frac * a
+
+            armed_this_bar = False
+            if c[i] > or_hi and slope_ok_long and pending_dir != 1:
+                pending_dir, pending_level, bars_since_confirm = 1, or_hi, 0
+                armed_this_bar = True
+            elif c[i] < or_lo and slope_ok_short and pending_dir != -1:
+                pending_dir, pending_level, bars_since_confirm = -1, or_lo, 0
+                armed_this_bar = True
+            elif pending_dir != 0:
+                bars_since_confirm += 1
+                if bars_since_confirm > max_wait:
+                    pending_dir = 0
+
+            # ---- pullback fill (never on the bar the order was just armed --
+            # that bar's own wick reaching back to the level isn't a genuine
+            # subsequent pullback, just noise inside the confirming candle) ----
+            if not armed_this_bar:
+                if pending_dir == 1 and l[i] <= pending_level:
+                    position, stop_level, extreme = 1, or_lo, c[i]
+                    bars_held, pending_dir, filled_today = 0, 0, True
+                elif pending_dir == -1 and h[i] >= pending_level:
+                    position, stop_level, extreme = -1, or_hi, c[i]
+                    bars_held, pending_dir, filled_today = 0, 0, True
+
+        signal[i] = position
+
+    return (pd.Series(signal, index=idx, name="signal"),
+            pd.Series(np.ones(n), index=idx, name="size_scalar"))
+
+
+def sample_orb_pullback_params(rng) -> dict:
+    return {
+        "sma_period":         int(rng.choice([10, 15, 20, 30])),
+        "slope_lookback":     int(rng.choice([2, 3, 5])),
+        "slope_min_atr_frac": float(rng.choice([0.0, 0.02, 0.05, 0.10])),
+        "max_wait_bars":      int(rng.choice([12, 18, 24, 36])),
+        "stop_atr_mult":      float(rng.choice([1.0, 1.5, 2.0, 2.5])),
+        "max_hold_bars":      int(rng.choice([24, 36, 48, 60])),
+    }
+
+
+# ============================================================================
+# EXPERIMENTAL: VWAP standard-deviation band mean-reversion
+# ============================================================================
+#
+# Anchored intraday VWAP (session anchor 18:00 ET -- the electronic futures
+# session open) plus volume-weighted standard-deviation bands, computed with
+# the standard cumulative-moment formula (mean = cumsum(vol*tp)/cumsum(vol),
+# var = cumsum(vol*tp^2)/cumsum(vol) - mean^2) so the bands only ever use
+# same-session history up to and including the current bar -- no look-ahead.
+#
+# Fade a 2.5-sigma touch back toward 1-sigma, gated by RSI (>75 / <25 on
+# whatever bar interval this is run on -- the original idea specified a
+# 1-minute RSI; this repo's bars are 5-minute, so the RSI window is in 5m
+# bars here, not literally 1-minute ticks). Hard stop just past 3-sigma.
+
+VWAP_BANDS_DEFAULT_PARAMS: dict = {
+    "session_anchor_hour_et": 18,    # 18:00 ET session anchor
+    "entry_sd":     2.5,
+    "target_sd":    1.0,
+    "stop_sd":      3.0,
+    "rsi_window":   14,
+    "rsi_overbought": 75.0,
+    "rsi_oversold":   25.0,
+    "max_hold_bars":  48,
+}
+
+
+def _vwap_bands_rsi(close: pd.Series, window: int) -> pd.Series:
+    delta = close.diff()
+    up   = delta.clip(lower=0).rolling(window).mean()
+    down = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = up / (down + 1e-12)
+    return 100 - 100 / (1 + rs)
+
+
+def generate_vwap_bands_signal(
+    df_5m: pd.DataFrame,
+    params: dict | None = None,
+    instrument_key: str = "",
+) -> tuple[pd.Series, pd.Series]:
+    p = {**VWAP_BANDS_DEFAULT_PARAMS, **(params or {})}
+    idx = df_5m.index
+    n = len(df_5m)
+
+    h = df_5m["high"].values
+    l = df_5m["low"].values
+    c = df_5m["close"].values
+    v = df_5m["volume"].astype(float)
+    tp = (df_5m["high"] + df_5m["low"] + df_5m["close"]) / 3.0
+
+    anchor_h = int(p["session_anchor_hour_et"])
+    et = idx.tz_convert(config.SESSION.timezone)
+    session_date = (et - pd.Timedelta(hours=anchor_h)).date
+
+    vol_tp  = v * tp
+    vol_tp2 = v * tp * tp
+    cum_vol   = v.groupby(session_date).cumsum()
+    cum_vtp   = vol_tp.groupby(session_date).cumsum()
+    cum_vtp2  = vol_tp2.groupby(session_date).cumsum()
+
+    vwap = (cum_vtp / cum_vol).values
+    var  = (cum_vtp2 / cum_vol).values - vwap ** 2
+    sd   = np.sqrt(np.clip(var, 0.0, None))
+
+    rsi = _vwap_bands_rsi(df_5m["close"], int(p["rsi_window"])).values
+
+    entry_sd, target_sd, stop_sd = float(p["entry_sd"]), float(p["target_sd"]), float(p["stop_sd"])
+    rsi_ob, rsi_os = float(p["rsi_overbought"]), float(p["rsi_oversold"])
+    max_hold = int(p["max_hold_bars"])
+
+    signal = np.zeros(n, dtype=float)
+    position, bars_held = 0, 0
+    stop_level = target_level = np.nan
+
+    for i in range(n):
+        if not np.isfinite(vwap[i]) or not np.isfinite(sd[i]) or sd[i] <= 0:
+            signal[i] = position
+            continue
+
+        if position != 0:
+            bars_held += 1
+            hit_stop = (position == 1 and l[i] <= stop_level) or \
+                       (position == -1 and h[i] >= stop_level)
+            hit_target = (position == 1 and h[i] >= target_level) or \
+                         (position == -1 and l[i] <= target_level)
+            if hit_stop or hit_target or bars_held >= max_hold:
+                position, bars_held = 0, 0
+                stop_level = target_level = np.nan
+
+        if position == 0 and np.isfinite(rsi[i]):
+            upper_entry, upper_target, upper_stop = (vwap[i] + entry_sd * sd[i],
+                                                      vwap[i] + target_sd * sd[i],
+                                                      vwap[i] + stop_sd * sd[i])
+            lower_entry, lower_target, lower_stop = (vwap[i] - entry_sd * sd[i],
+                                                      vwap[i] - target_sd * sd[i],
+                                                      vwap[i] - stop_sd * sd[i])
+            if c[i] >= upper_entry and rsi[i] > rsi_ob:
+                position = -1
+                stop_level, target_level = upper_stop, upper_target
+                bars_held = 0
+            elif c[i] <= lower_entry and rsi[i] < rsi_os:
+                position = 1
+                stop_level, target_level = lower_stop, lower_target
+                bars_held = 0
+
+        signal[i] = position
+
+    return (pd.Series(signal, index=idx, name="signal"),
+            pd.Series(np.ones(n), index=idx, name="size_scalar"))
+
+
+def sample_vwap_bands_params(rng) -> dict:
+    return {
+        "entry_sd":       float(rng.choice([2.0, 2.25, 2.5, 2.75, 3.0])),
+        "target_sd":      float(rng.choice([0.5, 1.0, 1.5])),
+        "stop_sd":        float(rng.choice([3.0, 3.5, 4.0])),
+        "rsi_window":     int(rng.choice([10, 14, 20])),
+        "rsi_overbought": float(rng.choice([70.0, 75.0, 80.0])),
+        "rsi_oversold":   float(rng.choice([20.0, 25.0, 30.0])),
+        "max_hold_bars":  int(rng.choice([24, 36, 48, 60])),
+    }
+
+
+# ============================================================================
+# EXPERIMENTAL: macro-catalyst news fade
+# ============================================================================
+#
+# The original idea keys off NFP/CPI at 08:30 ET using a real economic
+# calendar ("if the first 1-minute candle moves more than 3x the standard
+# daily ATR"). This repo has no calendar data source, so instead of trying to
+# know WHICH day is a release day, this uses the release's own signature as
+# the trigger: an abnormally large 08:30 ET candle relative to the recent
+# daily ATR. That catches real NFP/CPI days without a calendar, at the cost
+# of also catching any other 08:30 candle that happens to be unusually large
+# for an unrelated reason. Also adapted: the original spec measures a
+# 1-minute candle against 3x daily ATR; this runs on 5-minute bars, so
+# `spike_atr_mult` defaults much lower (a 5m candle covers 5x the time, so
+# reaching the same multiple of daily ATR is a much higher bar) -- tune it
+# for your instrument rather than trusting the default.
+
+NEWS_FADE_DEFAULT_PARAMS: dict = {
+    "release_min_et":   8 * 60 + 30,  # 08:30 ET -- NFP/CPI release time
+    "spike_atr_mult":   1.5,          # 5m spike range >= this * daily ATR
+    "daily_atr_window": 14,
+    "fib_level":        0.618,
+    "max_wait_bars":    3,            # bars after the spike to wait for the retrace fill
+    "stop_atr_mult":    0.25,         # extra buffer beyond the spike extreme, in 5m ATR
+    "max_hold_bars":    24,
+}
+
+
+def generate_news_fade_signal(
+    df_5m: pd.DataFrame,
+    params: dict | None = None,
+    instrument_key: str = "",
+) -> tuple[pd.Series, pd.Series]:
+    p = {**NEWS_FADE_DEFAULT_PARAMS, **(params or {})}
+    idx = df_5m.index
+    n = len(df_5m)
+    minutes = _minutes_et(idx)
+
+    o = df_5m["open"].values
+    h = df_5m["high"].values
+    l = df_5m["low"].values
+    c = df_5m["close"].values
+
+    atr5 = _structure_atr(df_5m, 14).fillna(0.0).values
+
+    df_d = _resample_daily(df_5m)
+    daily_atr = _structure_atr(df_d, int(p["daily_atr_window"]))
+    # shift(1): only the prior COMPLETED day's ATR is known intraday today
+    daily_atr_5m = daily_atr.shift(1).reindex(idx, method="ffill").values
+
+    release_min = int(p["release_min_et"])
+    spike_mult  = float(p["spike_atr_mult"])
+    fib         = float(p["fib_level"])
+    max_wait    = int(p["max_wait_bars"])
+    stop_mult   = float(p["stop_atr_mult"])
+    max_hold    = int(p["max_hold_bars"])
+
+    signal = np.zeros(n, dtype=float)
+    position, bars_held = 0, 0
+    stop_level = target_level = np.nan
+
+    pending_dir = 0
+    pending_level = np.nan
+    pending_deadline = -1
+
+    for i in range(n):
+        if position != 0:
+            bars_held += 1
+            hit_stop = (position == 1 and l[i] <= stop_level) or \
+                       (position == -1 and h[i] >= stop_level)
+            hit_target = (position == 1 and h[i] >= target_level) or \
+                         (position == -1 and l[i] <= target_level)
+            if hit_stop or hit_target or bars_held >= max_hold:
+                position, bars_held = 0, 0
+                stop_level = target_level = np.nan
+
+        # ---- detect the news candle exactly at the release minute ----
+        armed_this_bar = False
+        if minutes[i] == release_min and np.isfinite(daily_atr_5m[i]) and daily_atr_5m[i] > 0:
+            bar_range = h[i] - l[i]
+            if bar_range >= spike_mult * daily_atr_5m[i] and c[i] != o[i]:
+                rng = h[i] - l[i]
+                if c[i] > o[i]:      # bullish spike -> fade short toward the fib retrace
+                    pending_dir   = -1
+                    pending_level = h[i] - fib * rng
+                    stop_level_arm = h[i] + stop_mult * atr5[i]
+                else:                # bearish spike -> fade long toward the fib retrace
+                    pending_dir   = 1
+                    pending_level = l[i] + fib * rng
+                    stop_level_arm = l[i] - stop_mult * atr5[i]
+                pending_deadline = i + max_wait
+                pending_target   = o[i]     # target: full reversion to the pre-spike level
+                pending_stop     = stop_level_arm
+                armed_this_bar   = True
+
+        # ---- wait for the retrace fill (never on the spike bar itself -- the
+        # fib level sits INSIDE that candle's own high/low by construction, so
+        # its own wick would always trivially satisfy the fill check) ----
+        if not armed_this_bar and position == 0 and pending_dir != 0:
+            if i > pending_deadline:
+                pending_dir = 0
+            elif pending_dir == -1 and l[i] <= pending_level:
+                position, stop_level, target_level = -1, pending_stop, pending_target
+                bars_held, pending_dir = 0, 0
+            elif pending_dir == 1 and h[i] >= pending_level:
+                position, stop_level, target_level = 1, pending_stop, pending_target
+                bars_held, pending_dir = 0, 0
+
+        signal[i] = position
+
+    return (pd.Series(signal, index=idx, name="signal"),
+            pd.Series(np.ones(n), index=idx, name="size_scalar"))
+
+
+def sample_news_fade_params(rng) -> dict:
+    return {
+        "spike_atr_mult":   float(rng.choice([0.75, 1.0, 1.25, 1.5, 2.0])),
+        "daily_atr_window": int(rng.choice([10, 14, 20])),
+        "fib_level":        float(rng.choice([0.5, 0.618, 0.786])),
+        "max_wait_bars":    int(rng.choice([2, 3, 5, 8])),
+        "stop_atr_mult":    float(rng.choice([0.0, 0.25, 0.5])),
+        "max_hold_bars":    int(rng.choice([12, 24, 36])),
     }

@@ -959,3 +959,639 @@ def run_structure_walk_forward(
         oos_taken       = oos_taken,
         oos_skipped     = oos_skipped,
     )
+
+
+# ============================================================================
+# EXPERIMENTAL: session-gap reversal walk-forward
+# ============================================================================
+#
+# Same honest fit-train / select-embedded-validation / evaluate-once-OOS
+# methodology as the other optimizers above, EXCEPT the trade-count floor used
+# to reject a sampled config is the `min_trades` ARGUMENT (default 3), not
+# config.WALKFORWARD.min_trades_in_sample (default 10). This is a deliberate
+# BYPASS of the usual gate: strategies.generate_session_gap_signal fires at
+# most once per calendar day, so the normal floor would reject nearly every
+# fold before we ever saw whether the idea is worth pursuing. Read the
+# resulting trade counts accordingly -- a handful of trades per fold is a
+# first look, not a statistically reliable sample.
+
+@dataclass
+class SessionGapWFResult:
+    oos_equity: pd.Series
+    fold_summaries: pd.DataFrame
+    oos_metrics: dict
+    chosen_params: list[dict]
+    degradation: dict
+    min_trades_used: int
+
+
+def _session_gap_objective(metrics: dict, min_trades: int) -> float:
+    if metrics["n_trades"] < min_trades:
+        return -np.inf
+    sharpe = metrics["sharpe"]
+    pf     = metrics["profit_factor"] or 0.0
+    dd     = abs(metrics["max_drawdown_pct"]) / 100.0
+    return sharpe + 0.3 * min(pf, 3.0) - 2.0 * dd
+
+
+def run_session_gap_walk_forward(target_df: pd.DataFrame,
+                                 instrument_key: str,
+                                 n_contracts: int = 1,
+                                 wf: config.WalkForward | None = None,
+                                 verbose: bool = True,
+                                 min_trades: int = 3) -> SessionGapWFResult:
+    wf  = wf or config.WALKFORWARD
+    rng = np.random.default_rng(wf.random_seed)
+
+    n = len(target_df)
+    starts = range(0, n - wf.train_bars - wf.test_bars + 1, wf.step_bars)
+
+    fold_rows, oos_curves, chosen, is_metric_list, oos_trades_all = [], [], [], [], []
+    last_equity = config.TOPSTEP.starting_balance
+    skipped = 0
+
+    for fold_id, s in enumerate(starts):
+        tr0, tr1 = s, s + wf.train_bars
+        te0, te1 = tr1, min(tr1 + wf.test_bars, n)
+        if te1 - te0 < 50:
+            continue
+
+        tdf_tr = target_df.iloc[tr0:tr1]
+        tdf_te = target_df.iloc[te0:te1]
+
+        split   = int(len(tdf_tr) * 0.70)
+        tdf_fit = tdf_tr.iloc[:split]
+        tdf_val = tdf_tr.iloc[split:]
+
+        best_obj, best_params, best_val = -np.inf, None, None
+        for _ in range(wf.n_param_samples):
+            params = strat.sample_session_gap_params(rng)
+            # 200-bar warmup context so the London/day-boundary state is sane
+            # at the start of the validation slice.
+            sig_val = strat.generate_session_gap_signal(
+                pd.concat([tdf_fit.iloc[-200:], tdf_val]), params, instrument_key
+            )[0].iloc[200:]
+            if len(sig_val) == 0:
+                continue
+            vm  = bt.quick_metrics(tdf_val, sig_val, instrument_key, n_contracts)
+            obj = _session_gap_objective(vm, min_trades)
+            if obj > best_obj:
+                best_obj, best_params, best_val = obj, params, vm
+
+        if best_params is None:
+            skipped += 1
+            if verbose:
+                print(f"  fold {fold_id:2d} | skipped -- no config cleared "
+                      f"min_trades={min_trades} on validation")
+            continue
+
+        warmup = tdf_tr.iloc[-200:]
+        sig_full = strat.generate_session_gap_signal(
+            pd.concat([warmup, tdf_te]), best_params, instrument_key
+        )[0].iloc[200:]
+
+        safe_eq    = max(last_equity, 1.0)
+        rules_fold = config.TopstepRules(**{**config.TOPSTEP.__dict__})
+        rules_fold.starting_balance = safe_eq
+
+        res_te = bt.run_backtest(tdf_te, sig_full, instrument_key,
+                                 n_contracts, rules=rules_fold)
+
+        end_eq = float(res_te.equity.iloc[-1])
+        if not np.isfinite(end_eq) or end_eq <= 0:
+            end_eq = safe_eq
+        last_equity = end_eq
+
+        oos_curves.append(res_te.equity.clip(lower=1.0).ffill())
+        if len(res_te.trades):
+            oos_trades_all.append(res_te.trades)
+        chosen.append(best_params)
+        is_metric_list.append(best_val)
+
+        m = res_te.metrics
+        pnl_str = f"${m['total_pnl_$']:+,.0f}" if np.isfinite(m['total_pnl_$']) else "$nan"
+        fold_rows.append({
+            "fold":            fold_id,
+            "test_start":      target_df.index[te0],
+            "test_end":        target_df.index[te1 - 1],
+            "is_sharpe":       best_val["sharpe"],
+            "oos_sharpe":      m["sharpe"],
+            "oos_pnl_$":       m["total_pnl_$"],
+            "oos_trades":      m["n_trades"],
+            "oos_win_rate":    m["win_rate"],
+            "oos_max_dd_pct":  m["max_drawdown_pct"],
+            "sweep_atr_mult":  best_params["sweep_atr_mult"],
+            "stop_atr_mult":   best_params["stop_atr_mult"],
+        })
+        if verbose:
+            print(f"  fold {fold_id:2d} | IS {best_val['sharpe']:+.2f} "
+                  f"-> OOS {m['sharpe']:+.2f} | {pnl_str} | {m['n_trades']} trades "
+                  f"(min_trades={min_trades}) | sweep={best_params['sweep_atr_mult']}x "
+                  f"stop={best_params['stop_atr_mult']}x")
+
+    if not oos_curves:
+        raise RuntimeError(
+            f"No valid folds -- {skipped} skipped even with min_trades={min_trades}.\n"
+            "Try a lower --min-trades, more --n-samples, or a longer data window."
+        )
+    if skipped:
+        print(f"  ({skipped} fold(s) skipped even with the relaxed min_trades={min_trades})")
+
+    oos_equity = pd.concat(oos_curves)
+    oos_equity = oos_equity[~oos_equity.index.duplicated(keep="last")].sort_index().ffill()
+    oos_rets   = oos_equity.diff().fillna(0.0)
+    folds      = pd.DataFrame(fold_rows)
+    oos_trades = (pd.concat(oos_trades_all, ignore_index=True)
+                  if oos_trades_all else pd.DataFrame(columns=["pnl_$"]))
+
+    oos_metrics = bt._compute_metrics(
+        oos_equity, oos_rets, oos_trades, config.INTERVAL, oos_equity.iloc[0])
+    oos_metrics["pct_folds_profitable"] = round(
+        float((folds["oos_pnl_$"] > 0).mean()) * 100, 1) if len(folds) else 0.0
+    oos_metrics["topstep"] = ts.evaluate(oos_equity, config.TOPSTEP)
+
+    is_sharpes = [m["sharpe"] for m in is_metric_list]
+    is_mean    = round(float(np.mean(is_sharpes)), 3) if is_sharpes else None
+    oos_s      = oos_metrics["sharpe"]
+    degradation = {
+        "is_sharpe_mean": is_mean,
+        "oos_sharpe":     oos_s,
+        "sharpe_retention_pct": (round(oos_s / is_mean * 100, 1)
+                                 if is_mean and is_mean != 0 else None),
+    }
+
+    return SessionGapWFResult(
+        oos_equity=oos_equity,
+        fold_summaries=folds,
+        oos_metrics=oos_metrics,
+        chosen_params=chosen,
+        degradation=degradation,
+        min_trades_used=min_trades,
+    )
+
+
+# ============================================================================
+# EXPERIMENTAL: ORB pullback / VWAP bands / news fade walk-forward
+# ============================================================================
+#
+# Same shape as run_session_gap_walk_forward just above (raw OHLCV, no
+# features, a `min_trades` bypass of the usual config.WALKFORWARD floor) --
+# kept as separate functions rather than one generic helper to match this
+# file's existing per-strategy-family convention (trend/reactive/structure
+# above are likewise separate despite sharing structure).
+
+@dataclass
+class OrbPullbackWFResult:
+    oos_equity: pd.Series
+    fold_summaries: pd.DataFrame
+    oos_metrics: dict
+    chosen_params: list[dict]
+    degradation: dict
+    min_trades_used: int
+
+
+def _orb_pullback_objective(metrics: dict, min_trades: int) -> float:
+    if metrics["n_trades"] < min_trades:
+        return -np.inf
+    sharpe = metrics["sharpe"]
+    pf     = metrics["profit_factor"] or 0.0
+    dd     = abs(metrics["max_drawdown_pct"]) / 100.0
+    return sharpe + 0.3 * min(pf, 3.0) - 2.0 * dd
+
+
+def run_orb_pullback_walk_forward(target_df: pd.DataFrame,
+                                  instrument_key: str,
+                                  n_contracts: int = 1,
+                                  wf: config.WalkForward | None = None,
+                                  verbose: bool = True,
+                                  min_trades: int = 5) -> OrbPullbackWFResult:
+    wf  = wf or config.WALKFORWARD
+    rng = np.random.default_rng(wf.random_seed)
+
+    n = len(target_df)
+    starts = range(0, n - wf.train_bars - wf.test_bars + 1, wf.step_bars)
+
+    fold_rows, oos_curves, chosen, is_metric_list, oos_trades_all = [], [], [], [], []
+    last_equity = config.TOPSTEP.starting_balance
+    skipped = 0
+
+    for fold_id, s in enumerate(starts):
+        tr0, tr1 = s, s + wf.train_bars
+        te0, te1 = tr1, min(tr1 + wf.test_bars, n)
+        if te1 - te0 < 50:
+            continue
+
+        tdf_tr = target_df.iloc[tr0:tr1]
+        tdf_te = target_df.iloc[te0:te1]
+        split   = int(len(tdf_tr) * 0.70)
+        tdf_fit = tdf_tr.iloc[:split]
+        tdf_val = tdf_tr.iloc[split:]
+
+        best_obj, best_params, best_val = -np.inf, None, None
+        for _ in range(wf.n_param_samples):
+            params = strat.sample_orb_pullback_params(rng)
+            sig_val = strat.generate_orb_pullback_signal(
+                pd.concat([tdf_fit.iloc[-200:], tdf_val]), params, instrument_key
+            )[0].iloc[200:]
+            if len(sig_val) == 0:
+                continue
+            vm  = bt.quick_metrics(tdf_val, sig_val, instrument_key, n_contracts)
+            obj = _orb_pullback_objective(vm, min_trades)
+            if obj > best_obj:
+                best_obj, best_params, best_val = obj, params, vm
+
+        if best_params is None:
+            skipped += 1
+            if verbose:
+                print(f"  fold {fold_id:2d} | skipped -- no config cleared "
+                      f"min_trades={min_trades} on validation")
+            continue
+
+        warmup = tdf_tr.iloc[-200:]
+        sig_full = strat.generate_orb_pullback_signal(
+            pd.concat([warmup, tdf_te]), best_params, instrument_key
+        )[0].iloc[200:]
+
+        safe_eq    = max(last_equity, 1.0)
+        rules_fold = config.TopstepRules(**{**config.TOPSTEP.__dict__})
+        rules_fold.starting_balance = safe_eq
+
+        res_te = bt.run_backtest(tdf_te, sig_full, instrument_key,
+                                 n_contracts, rules=rules_fold)
+
+        end_eq = float(res_te.equity.iloc[-1])
+        if not np.isfinite(end_eq) or end_eq <= 0:
+            end_eq = safe_eq
+        last_equity = end_eq
+
+        oos_curves.append(res_te.equity.clip(lower=1.0).ffill())
+        if len(res_te.trades):
+            oos_trades_all.append(res_te.trades)
+        chosen.append(best_params)
+        is_metric_list.append(best_val)
+
+        m = res_te.metrics
+        pnl_str = f"${m['total_pnl_$']:+,.0f}" if np.isfinite(m['total_pnl_$']) else "$nan"
+        fold_rows.append({
+            "fold":            fold_id,
+            "test_start":      target_df.index[te0],
+            "test_end":        target_df.index[te1 - 1],
+            "is_sharpe":       best_val["sharpe"],
+            "oos_sharpe":      m["sharpe"],
+            "oos_pnl_$":       m["total_pnl_$"],
+            "oos_trades":      m["n_trades"],
+            "oos_win_rate":    m["win_rate"],
+            "sma_period":      best_params["sma_period"],
+            "stop_atr_mult":   best_params["stop_atr_mult"],
+        })
+        if verbose:
+            print(f"  fold {fold_id:2d} | IS {best_val['sharpe']:+.2f} "
+                  f"-> OOS {m['sharpe']:+.2f} | {pnl_str} | {m['n_trades']} trades "
+                  f"(min_trades={min_trades})")
+
+    if not oos_curves:
+        raise RuntimeError(
+            f"No valid folds -- {skipped} skipped even with min_trades={min_trades}.\n"
+            "Try a lower --min-trades, more --n-samples, or a longer data window."
+        )
+    if skipped:
+        print(f"  ({skipped} fold(s) skipped even with the relaxed min_trades={min_trades})")
+
+    oos_equity = pd.concat(oos_curves)
+    oos_equity = oos_equity[~oos_equity.index.duplicated(keep="last")].sort_index().ffill()
+    oos_rets   = oos_equity.diff().fillna(0.0)
+    folds      = pd.DataFrame(fold_rows)
+    oos_trades = (pd.concat(oos_trades_all, ignore_index=True)
+                  if oos_trades_all else pd.DataFrame(columns=["pnl_$"]))
+
+    oos_metrics = bt._compute_metrics(
+        oos_equity, oos_rets, oos_trades, config.INTERVAL, oos_equity.iloc[0])
+    oos_metrics["pct_folds_profitable"] = round(
+        float((folds["oos_pnl_$"] > 0).mean()) * 100, 1) if len(folds) else 0.0
+    oos_metrics["topstep"] = ts.evaluate(oos_equity, config.TOPSTEP)
+
+    is_sharpes = [m["sharpe"] for m in is_metric_list]
+    is_mean    = round(float(np.mean(is_sharpes)), 3) if is_sharpes else None
+    oos_s      = oos_metrics["sharpe"]
+    degradation = {
+        "is_sharpe_mean": is_mean,
+        "oos_sharpe":     oos_s,
+        "sharpe_retention_pct": (round(oos_s / is_mean * 100, 1)
+                                 if is_mean and is_mean != 0 else None),
+    }
+
+    return OrbPullbackWFResult(
+        oos_equity=oos_equity,
+        fold_summaries=folds,
+        oos_metrics=oos_metrics,
+        chosen_params=chosen,
+        degradation=degradation,
+        min_trades_used=min_trades,
+    )
+
+
+@dataclass
+class VwapBandsWFResult:
+    oos_equity: pd.Series
+    fold_summaries: pd.DataFrame
+    oos_metrics: dict
+    chosen_params: list[dict]
+    degradation: dict
+    min_trades_used: int
+
+
+def _vwap_bands_objective(metrics: dict, min_trades: int) -> float:
+    if metrics["n_trades"] < min_trades:
+        return -np.inf
+    sharpe = metrics["sharpe"]
+    pf     = metrics["profit_factor"] or 0.0
+    dd     = abs(metrics["max_drawdown_pct"]) / 100.0
+    return sharpe + 0.25 * min(pf, 3.0) - 2.0 * dd
+
+
+def run_vwap_bands_walk_forward(target_df: pd.DataFrame,
+                                instrument_key: str,
+                                n_contracts: int = 1,
+                                wf: config.WalkForward | None = None,
+                                verbose: bool = True,
+                                min_trades: int = 10) -> VwapBandsWFResult:
+    wf  = wf or config.WALKFORWARD
+    rng = np.random.default_rng(wf.random_seed)
+
+    n = len(target_df)
+    starts = range(0, n - wf.train_bars - wf.test_bars + 1, wf.step_bars)
+
+    fold_rows, oos_curves, chosen, is_metric_list, oos_trades_all = [], [], [], [], []
+    last_equity = config.TOPSTEP.starting_balance
+    skipped = 0
+
+    for fold_id, s in enumerate(starts):
+        tr0, tr1 = s, s + wf.train_bars
+        te0, te1 = tr1, min(tr1 + wf.test_bars, n)
+        if te1 - te0 < 50:
+            continue
+
+        tdf_tr = target_df.iloc[tr0:tr1]
+        tdf_te = target_df.iloc[te0:te1]
+        split   = int(len(tdf_tr) * 0.70)
+        tdf_fit = tdf_tr.iloc[:split]
+        tdf_val = tdf_tr.iloc[split:]
+
+        best_obj, best_params, best_val = -np.inf, None, None
+        for _ in range(wf.n_param_samples):
+            params = strat.sample_vwap_bands_params(rng)
+            # VWAP is session-anchored (18:00 ET), so prepend full sessions of
+            # warmup rather than a fixed bar count for a sane running VWAP/SD.
+            sig_val = strat.generate_vwap_bands_signal(
+                pd.concat([tdf_fit.iloc[-300:], tdf_val]), params, instrument_key
+            )[0].iloc[300:]
+            if len(sig_val) == 0:
+                continue
+            vm  = bt.quick_metrics(tdf_val, sig_val, instrument_key, n_contracts)
+            obj = _vwap_bands_objective(vm, min_trades)
+            if obj > best_obj:
+                best_obj, best_params, best_val = obj, params, vm
+
+        if best_params is None:
+            skipped += 1
+            if verbose:
+                print(f"  fold {fold_id:2d} | skipped -- no config cleared "
+                      f"min_trades={min_trades} on validation")
+            continue
+
+        warmup = tdf_tr.iloc[-300:]
+        sig_full = strat.generate_vwap_bands_signal(
+            pd.concat([warmup, tdf_te]), best_params, instrument_key
+        )[0].iloc[300:]
+
+        safe_eq    = max(last_equity, 1.0)
+        rules_fold = config.TopstepRules(**{**config.TOPSTEP.__dict__})
+        rules_fold.starting_balance = safe_eq
+
+        res_te = bt.run_backtest(tdf_te, sig_full, instrument_key,
+                                 n_contracts, rules=rules_fold)
+
+        end_eq = float(res_te.equity.iloc[-1])
+        if not np.isfinite(end_eq) or end_eq <= 0:
+            end_eq = safe_eq
+        last_equity = end_eq
+
+        oos_curves.append(res_te.equity.clip(lower=1.0).ffill())
+        if len(res_te.trades):
+            oos_trades_all.append(res_te.trades)
+        chosen.append(best_params)
+        is_metric_list.append(best_val)
+
+        m = res_te.metrics
+        pnl_str = f"${m['total_pnl_$']:+,.0f}" if np.isfinite(m['total_pnl_$']) else "$nan"
+        fold_rows.append({
+            "fold":            fold_id,
+            "test_start":      target_df.index[te0],
+            "test_end":        target_df.index[te1 - 1],
+            "is_sharpe":       best_val["sharpe"],
+            "oos_sharpe":      m["sharpe"],
+            "oos_pnl_$":       m["total_pnl_$"],
+            "oos_trades":      m["n_trades"],
+            "oos_win_rate":    m["win_rate"],
+            "entry_sd":        best_params["entry_sd"],
+            "rsi_window":      best_params["rsi_window"],
+        })
+        if verbose:
+            print(f"  fold {fold_id:2d} | IS {best_val['sharpe']:+.2f} "
+                  f"-> OOS {m['sharpe']:+.2f} | {pnl_str} | {m['n_trades']} trades "
+                  f"(min_trades={min_trades})")
+
+    if not oos_curves:
+        raise RuntimeError(
+            f"No valid folds -- {skipped} skipped even with min_trades={min_trades}.\n"
+            "Try a lower --min-trades, more --n-samples, or a longer data window."
+        )
+    if skipped:
+        print(f"  ({skipped} fold(s) skipped even with the relaxed min_trades={min_trades})")
+
+    oos_equity = pd.concat(oos_curves)
+    oos_equity = oos_equity[~oos_equity.index.duplicated(keep="last")].sort_index().ffill()
+    oos_rets   = oos_equity.diff().fillna(0.0)
+    folds      = pd.DataFrame(fold_rows)
+    oos_trades = (pd.concat(oos_trades_all, ignore_index=True)
+                  if oos_trades_all else pd.DataFrame(columns=["pnl_$"]))
+
+    oos_metrics = bt._compute_metrics(
+        oos_equity, oos_rets, oos_trades, config.INTERVAL, oos_equity.iloc[0])
+    oos_metrics["pct_folds_profitable"] = round(
+        float((folds["oos_pnl_$"] > 0).mean()) * 100, 1) if len(folds) else 0.0
+    oos_metrics["topstep"] = ts.evaluate(oos_equity, config.TOPSTEP)
+
+    is_sharpes = [m["sharpe"] for m in is_metric_list]
+    is_mean    = round(float(np.mean(is_sharpes)), 3) if is_sharpes else None
+    oos_s      = oos_metrics["sharpe"]
+    degradation = {
+        "is_sharpe_mean": is_mean,
+        "oos_sharpe":     oos_s,
+        "sharpe_retention_pct": (round(oos_s / is_mean * 100, 1)
+                                 if is_mean and is_mean != 0 else None),
+    }
+
+    return VwapBandsWFResult(
+        oos_equity=oos_equity,
+        fold_summaries=folds,
+        oos_metrics=oos_metrics,
+        chosen_params=chosen,
+        degradation=degradation,
+        min_trades_used=min_trades,
+    )
+
+
+@dataclass
+class NewsFadeWFResult:
+    oos_equity: pd.Series
+    fold_summaries: pd.DataFrame
+    oos_metrics: dict
+    chosen_params: list[dict]
+    degradation: dict
+    min_trades_used: int
+
+
+def _news_fade_objective(metrics: dict, min_trades: int) -> float:
+    if metrics["n_trades"] < min_trades:
+        return -np.inf
+    sharpe = metrics["sharpe"]
+    pf     = metrics["profit_factor"] or 0.0
+    dd     = abs(metrics["max_drawdown_pct"]) / 100.0
+    return sharpe + 0.3 * min(pf, 3.0) - 2.0 * dd
+
+
+def run_news_fade_walk_forward(target_df: pd.DataFrame,
+                               instrument_key: str,
+                               n_contracts: int = 1,
+                               wf: config.WalkForward | None = None,
+                               verbose: bool = True,
+                               min_trades: int = 2) -> NewsFadeWFResult:
+    wf  = wf or config.WALKFORWARD
+    rng = np.random.default_rng(wf.random_seed)
+
+    n = len(target_df)
+    starts = range(0, n - wf.train_bars - wf.test_bars + 1, wf.step_bars)
+
+    fold_rows, oos_curves, chosen, is_metric_list, oos_trades_all = [], [], [], [], []
+    last_equity = config.TOPSTEP.starting_balance
+    skipped = 0
+
+    # Needs enough trailing daily bars for daily_atr_window (default 14 days)
+    # to be warm before we trust the spike-detection threshold.
+    warm = 20 * 78
+
+    for fold_id, s in enumerate(starts):
+        tr0, tr1 = s, s + wf.train_bars
+        te0, te1 = tr1, min(tr1 + wf.test_bars, n)
+        if te1 - te0 < 50:
+            continue
+
+        tdf_tr = target_df.iloc[tr0:tr1]
+        tdf_te = target_df.iloc[te0:te1]
+        split   = int(len(tdf_tr) * 0.70)
+        tdf_fit = tdf_tr.iloc[:split]
+        tdf_val = tdf_tr.iloc[split:]
+
+        best_obj, best_params, best_val = -np.inf, None, None
+        for _ in range(wf.n_param_samples):
+            params = strat.sample_news_fade_params(rng)
+            warmup_ctx = tdf_fit.iloc[-warm:] if len(tdf_fit) > warm else tdf_fit
+            sig_val = strat.generate_news_fade_signal(
+                pd.concat([warmup_ctx, tdf_val]), params, instrument_key
+            )[0].iloc[len(warmup_ctx):]
+            if len(sig_val) == 0:
+                continue
+            vm  = bt.quick_metrics(tdf_val, sig_val, instrument_key, n_contracts)
+            obj = _news_fade_objective(vm, min_trades)
+            if obj > best_obj:
+                best_obj, best_params, best_val = obj, params, vm
+
+        if best_params is None:
+            skipped += 1
+            if verbose:
+                print(f"  fold {fold_id:2d} | skipped -- no config cleared "
+                      f"min_trades={min_trades} on validation")
+            continue
+
+        warmup_ctx = tdf_tr.iloc[-warm:] if len(tdf_tr) > warm else tdf_tr
+        sig_full = strat.generate_news_fade_signal(
+            pd.concat([warmup_ctx, tdf_te]), best_params, instrument_key
+        )[0].iloc[len(warmup_ctx):]
+
+        safe_eq    = max(last_equity, 1.0)
+        rules_fold = config.TopstepRules(**{**config.TOPSTEP.__dict__})
+        rules_fold.starting_balance = safe_eq
+
+        res_te = bt.run_backtest(tdf_te, sig_full, instrument_key,
+                                 n_contracts, rules=rules_fold)
+
+        end_eq = float(res_te.equity.iloc[-1])
+        if not np.isfinite(end_eq) or end_eq <= 0:
+            end_eq = safe_eq
+        last_equity = end_eq
+
+        oos_curves.append(res_te.equity.clip(lower=1.0).ffill())
+        if len(res_te.trades):
+            oos_trades_all.append(res_te.trades)
+        chosen.append(best_params)
+        is_metric_list.append(best_val)
+
+        m = res_te.metrics
+        pnl_str = f"${m['total_pnl_$']:+,.0f}" if np.isfinite(m['total_pnl_$']) else "$nan"
+        fold_rows.append({
+            "fold":            fold_id,
+            "test_start":      target_df.index[te0],
+            "test_end":        target_df.index[te1 - 1],
+            "is_sharpe":       best_val["sharpe"],
+            "oos_sharpe":      m["sharpe"],
+            "oos_pnl_$":       m["total_pnl_$"],
+            "oos_trades":      m["n_trades"],
+            "oos_win_rate":    m["win_rate"],
+            "spike_atr_mult":  best_params["spike_atr_mult"],
+            "fib_level":       best_params["fib_level"],
+        })
+        if verbose:
+            print(f"  fold {fold_id:2d} | IS {best_val['sharpe']:+.2f} "
+                  f"-> OOS {m['sharpe']:+.2f} | {pnl_str} | {m['n_trades']} trades "
+                  f"(min_trades={min_trades})")
+
+    if not oos_curves:
+        raise RuntimeError(
+            f"No valid folds -- {skipped} skipped even with min_trades={min_trades}.\n"
+            "Try a lower --min-trades, more --n-samples, or a longer data window."
+        )
+    if skipped:
+        print(f"  ({skipped} fold(s) skipped even with the relaxed min_trades={min_trades})")
+
+    oos_equity = pd.concat(oos_curves)
+    oos_equity = oos_equity[~oos_equity.index.duplicated(keep="last")].sort_index().ffill()
+    oos_rets   = oos_equity.diff().fillna(0.0)
+    folds      = pd.DataFrame(fold_rows)
+    oos_trades = (pd.concat(oos_trades_all, ignore_index=True)
+                  if oos_trades_all else pd.DataFrame(columns=["pnl_$"]))
+
+    oos_metrics = bt._compute_metrics(
+        oos_equity, oos_rets, oos_trades, config.INTERVAL, oos_equity.iloc[0])
+    oos_metrics["pct_folds_profitable"] = round(
+        float((folds["oos_pnl_$"] > 0).mean()) * 100, 1) if len(folds) else 0.0
+    oos_metrics["topstep"] = ts.evaluate(oos_equity, config.TOPSTEP)
+
+    is_sharpes = [m["sharpe"] for m in is_metric_list]
+    is_mean    = round(float(np.mean(is_sharpes)), 3) if is_sharpes else None
+    oos_s      = oos_metrics["sharpe"]
+    degradation = {
+        "is_sharpe_mean": is_mean,
+        "oos_sharpe":     oos_s,
+        "sharpe_retention_pct": (round(oos_s / is_mean * 100, 1)
+                                 if is_mean and is_mean != 0 else None),
+    }
+
+    return NewsFadeWFResult(
+        oos_equity=oos_equity,
+        fold_summaries=folds,
+        oos_metrics=oos_metrics,
+        chosen_params=chosen,
+        degradation=degradation,
+        min_trades_used=min_trades,
+    )
